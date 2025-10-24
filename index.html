@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ERC-20 Batch Balance Checker</title>
+  <meta name="description" content="Paste addresses and a token contract; fetch ERC-20 balances using an RPC URL" />
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--muted:#9aa4b2;--accent:#4f46e5;--success:#16a34a}
+    *{box-sizing:border-box}
+    body{font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial; margin:0; background:linear-gradient(180deg,#071027 0%, #071d2a 100%); color:#e6eef6; padding:28px}
+    .wrap{max-width:980px;margin:0 auto}
+    .card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border:1px solid rgba(255,255,255,0.03); padding:20px;border-radius:12px;box-shadow:0 6px 24px rgba(2,6,23,0.6)}
+    h1{margin:0 0 8px;font-size:20px}
+    p.lead{margin:0 0 16px;color:var(--muted);font-size:13px}
+    label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+    input, textarea, button, select{font-size:14px}
+    input, textarea, select{width:100%;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:inherit}
+    textarea{min-height:120px;resize:vertical}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .actions{display:flex;gap:8px;align-items:center;margin-top:12px}
+    .btn{background:var(--accent);color:white;padding:10px 14px;border-radius:8px;border:none;cursor:pointer}
+    .btn.ghost{background:transparent;border:1px solid rgba(255,255,255,0.04)}
+    .btn.small{padding:8px 10px;font-size:13px}
+    .muted{color:var(--muted);font-size:13px}
+    .result-wrap{margin-top:18px}
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    th,td{padding:8px 10px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.02);font-size:13px}
+    th{color:var(--muted);font-weight:600}
+    td.right{text-align:right;font-family:ui-monospace,Menlo,Monaco,monospace}
+    .ok{color:var(--success)}
+    .err{color:#ff6b6b}
+    .total{background:rgba(255,255,255,0.02);padding:10px;border-radius:8px;margin-bottom:8px}
+    .small{font-size:12px;color:var(--muted)}
+    @media(max-width:700px){.grid{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>ERC-20 Batch Balance Checker</h1>
+      <p class="lead">Paste wallet addresses, add an ERC-20 token contract and an RPC URL (Infura/Alchemy/QuickNode) — the page will query <code>balanceOf</code> for each address and show totals.</p>
+
+      <div>
+        <label>RPC provider URL</label>
+        <input id="rpc" placeholder="https://mainnet.infura.io/v3/YOUR_KEY" />
+      </div>
+
+      <div class="grid" style="margin-top:12px">
+        <div>
+          <label>Token contract (ERC-20)</label>
+          <input id="token" placeholder="0x..." />
+        </div>
+        <div>
+          <label>Decimals (optional)</label>
+          <input id="decimals" placeholder="leave blank to auto-detect" />
+        </div>
+      </div>
+
+      <div style="margin-top:12px">
+        <label>Addresses (newline, comma or space separated)</label>
+        <textarea id="addresses" placeholder="0x1111..., 0x2222..., or paste many lines"></textarea>
+      </div>
+
+      <div class="actions">
+        <button id="example" class="btn small ghost">Insert example addresses</button>
+        <button id="clear" class="btn small ghost">Clear addresses</button>
+        <div style="flex:1"></div>
+        <button id="fetch" class="btn">Fetch balances</button>
+      </div>
+
+      <div id="status" class="small muted" style="margin-top:10px">Ready.</div>
+
+      <div id="results" class="result-wrap"></div>
+
+      <div style="margin-top:12px" class="small muted">Tip: for hundreds of addresses use a Multicall approach or a provider that supports batching to avoid rate limits. This demo performs individual <code>balanceOf</code> calls.</div>
+    </div>
+  </div>
+
+  <!-- ethers v6 (UMD) from jsdelivr -->
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6.9.0/dist/ethers.umd.min.js"></script>
+  <script>
+    // Minimal ERC-20 ABI
+    const ABI = [
+      'function balanceOf(address) view returns (uint256)',
+      'function decimals() view returns (uint8)',
+      'function symbol() view returns (string)',
+      'function name() view returns (string)'
+    ];
+
+    const $ = id => document.getElementById(id);
+    const rpcEl = $('rpc');
+    const tokenEl = $('token');
+    const decimalsEl = $('decimals');
+    const addressesEl = $('addresses');
+    const statusEl = $('status');
+    const resultsEl = $('results');
+    const fetchBtn = $('fetch');
+    const clearBtn = $('clear');
+    const exampleBtn = $('example');
+
+    exampleBtn.addEventListener('click', ()=>{
+      addressesEl.value = '0x742d35Cc6634C0532925a3b844Bc454e4438f44e\n0x53d284357ec70cE289D6D64134DfAc8E511c8a3D';
+    });
+    clearBtn.addEventListener('click', ()=>{ addressesEl.value=''; resultsEl.innerHTML=''; statusEl.textContent='Cleared.'});
+
+    function parseAddresses(raw){
+      if(!raw) return [];
+      return Array.from(new Set(raw.split(/[\n,;\s]+/).map(s=>s.trim()).filter(Boolean)));
+    }
+
+    function isEthereumAddress(addr){
+      try{ return ethers.isAddress(addr); }catch(e){ return false; }
+    }
+
+    async function fetchBalances(){
+      resultsEl.innerHTML = '';
+      statusEl.textContent = '';
+
+      const rpc = rpcEl.value.trim();
+      const token = tokenEl.value.trim();
+      const decimalsOverride = decimalsEl.value.trim();
+      const addresses = parseAddresses(addressesEl.value.trim());
+
+      if(addresses.length === 0){ statusEl.textContent = 'Add at least one address.'; return; }
+      if(!rpc){ statusEl.textContent = 'Add an RPC provider URL.'; return; }
+      if(!token){ statusEl.textContent = 'Add an ERC-20 token contract address.'; return; }
+
+      // provider & contract
+      statusEl.textContent = 'Connecting to RPC...';
+      let provider;
+      try{
+        provider = new ethers.JsonRpcProvider(rpc);
+      }catch(e){ statusEl.textContent = 'Invalid RPC URL.'; return; }
+
+      let contract;
+      try{ contract = new ethers.Contract(token, ABI, provider); }catch(e){ statusEl.textContent = 'Invalid contract address.'; return; }
+
+      // get decimals/symbol
+      let decimals = 18;
+      let symbol = '';
+      try{
+        if(decimalsOverride){ decimals = parseInt(decimalsOverride); if(isNaN(decimals)) decimals = 18; }
+        else { decimals = await contract.decimals().catch(()=>18); }
+      }catch(e){ decimals = 18; }
+      try{ symbol = await contract.symbol().catch(()=>token.slice(0,6)); }catch(e){ symbol = token.slice(0,6); }
+
+      statusEl.textContent = `Fetching balances for ${addresses.length} addresses...`;
+
+      const rows = [];
+      let total = 0n;
+
+      // simple sequential loop to be gentler on rate limits; you can parallelize if your RPC accepts it
+      for(let i=0;i<addresses.length;i++){
+        const addr = addresses[i];
+        if(!isEthereumAddress(addr)){
+          rows.push({address:addr,error:'Invalid address'});
+          continue;
+        }
+        statusEl.textContent = `Fetching ${i+1}/${addresses.length} — ${addr}`;
+        try{
+          const raw = await contract.balanceOf(addr);
+          // raw is BigInt in ethers v6
+          const formatted = ethers.formatUnits(raw, decimals);
+          rows.push({address:addr,raw:raw.toString(),formatted});
+          total += BigInt(raw.toString());
+        }catch(e){ rows.push({address:addr,error:(e?.message||String(e)).slice(0,200)}); }
+      }
+
+      // render
+      resultsEl.innerHTML = '';
+      const totalFormatted = ethers.formatUnits(total, decimals);
+      const header = document.createElement('div');
+      header.className = 'total';
+      header.innerHTML = `<strong>Total: ${totalFormatted} ${symbol || ''}</strong>`;
+      resultsEl.appendChild(header);
+
+      const table = document.createElement('table');
+      const thead = document.createElement('thead');
+      thead.innerHTML = '<tr><th>Address</th><th style="text-align:right">Balance</th><th style="text-align:right">Raw</th><th>Status</th></tr>';
+      table.appendChild(thead);
+      const tbody = document.createElement('tbody');
+
+      for(const r of rows){
+        const tr = document.createElement('tr');
+        const tdAddr = document.createElement('td'); tdAddr.textContent = r.address; tdAddr.style.fontFamily='ui-monospace,Menlo,Monaco,monospace';
+        const tdBal = document.createElement('td'); tdBal.className='right'; tdBal.textContent = r.formatted ? `${r.formatted} ${symbol}` : '-';
+        const tdRaw = document.createElement('td'); tdRaw.className='right'; tdRaw.textContent = r.raw ? r.raw : '-';
+        const tdStatus = document.createElement('td'); tdStatus.innerHTML = r.error ? `<span class="err">${r.error}</span>` : `<span class="ok">OK</span>`;
+        tr.appendChild(tdAddr); tr.appendChild(tdBal); tr.appendChild(tdRaw); tr.appendChild(tdStatus);
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      resultsEl.appendChild(table);
+
+      statusEl.textContent = 'Done.';
+    }
+
+    fetchBtn.addEventListener('click', ()=>{
+      fetchBtn.disabled = true; fetchBtn.textContent='Fetching...';
+      fetchBalances().finally(()=>{ fetchBtn.disabled=false; fetchBtn.textContent='Fetch balances'; });
+    });
+
+  </script>
+</body>
+</html>
